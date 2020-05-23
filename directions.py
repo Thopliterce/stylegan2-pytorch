@@ -1,16 +1,14 @@
 import torch
 import torchvision
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import argparse
 import os
 from model import Generator, Discriminator
 from PIL import Image
 import math
-
-def normalize_dir(dir):
-    dist = torch.norm(dir, dim=-1)
-    return dir / torch.unsqueeze(dist, -1)
+import time
 
 def main():
     device = "cuda"
@@ -39,10 +37,13 @@ def main():
 
     # Abusing the last class as the distance value
     classifier = Discriminator(size=args.size, inputs=6, outputs=args.dim*2).to(device)
-    dirs = torch.randn(args.dim, args.latent, device=device)
+    dirs = torch.randn(args.dim, args.latent, device=device, requires_grad=True)
     loss1 = nn.CrossEntropyLoss()
-    loss2 = nn.MSELoss()
-    opt = optim.Adam(list(classifier.parameters()) + [dirs], lr=1e-4)
+    loss2 = nn.MSELoss(reduction='sum')
+    opt = optim.Adam([
+        {'params': classifier.parameters(), 'lr': 1e-3},
+        {'params': [dirs], 'lr': 1e-2}
+    ])
     dist_stddev = math.sqrt(args.latent)
     if os.path.isfile(args.ckpt):
         ckpt = torch.load(args.ckpt)
@@ -50,10 +51,13 @@ def main():
         dirs = ckpt['dirs'].to(device)
         opt.load_state_dict(ckpt['opt'])
 
+    correct, total = 0, 0
+    step, last_time = 0, time.time()
     for i in range(args.round):
-        dirs = normalize_dir(dirs)
+        step += 1
         # Prepare random latent vectors and indices and dists without gradient
         with torch.no_grad():
+            dirs = F.normalize(dirs).detach()
             latents = torch.randn(args.batch, args.latent, device=device)
             latents = gen.get_latent(latents)
             # Currently we use 512-dim latents rather than 18,512-dim latents
@@ -72,15 +76,23 @@ def main():
         images2, _ = gen([latents2], input_is_latent=True)
         full_images = torch.cat([images1, images2], dim=1)
         predictions = classifier(full_images)
+        # Compute accuracy as well
+        _, predicted_indices = torch.max(predictions[:, :args.dim], 1)
+        total += args.batch
+        correct += (predicted_indices == dir_indices).sum().item()
+
         # The first `dim` values are the classification results, and
         # the last `dim` values are the expected distance
-        loss1val = loss1(predictions[:, :], dir_indices)
-        loss2val = loss2(predictions[:, -1], dists) / args.latent
+        loss1val = loss1(predictions[:, :args.dim], dir_indices)
+        loss2val = loss2(predictions[:, args.dim:args.dim*2], dists) / args.latent
         loss = loss1val + loss2val
         loss.backward()
         opt.step()
         if i % 10 == 9:
-            print("round %d done with loss1=%f loss2=%f" % (i+1, loss1val.item(), loss2val.item()))
+            print("round %d done with loss1=%f loss2=%f acc=%d/%d time=%f" %
+                (i+1, loss1val.item(), loss2val.item(), correct, total, (time.time()-last_time)/step))
+            step, last_time = 0, time.time()
+            correct, total = 0, 0
             # TODO: better rename
             tmp_file = args.ckpt + '.tmp'
             torch.save({
@@ -103,13 +115,14 @@ def show_directions():
     parser.add_argument('--genmodel', type=str, default="checkpoint/network-snapshot-017325.pt")
     parser.add_argument("--ckpt", type=str, default="checkpoint/direction.pt")
     parser.add_argument('--channel_multiplier', type=int, default=2)
-    parser.add_argument("--step", type=float, default=0.1)
-    parser.add_argument("--count", type=int, default=5)
+    parser.add_argument("--step", type=float, default=0.3)
+    parser.add_argument("--count", type=int, default=3)
     parser.add_argument("--sample", type=int, default=3)
 
     args = parser.parse_args()
     args.latent = 512
     args.n_mlp = 8
+    dist_stddev = math.sqrt(args.latent)
 
     ckpt = torch.load(args.genmodel)
     gen = Generator(
@@ -125,7 +138,7 @@ def show_directions():
     with torch.no_grad():
         center_latent = gen.get_latent(torch.randn(args.sample, args.latent, device=device))
         for i in range(args.dim):
-            steps = torch.arange(-args.step*args.count, args.step*(args.count+0.01), args.step, device=device)
+            steps = torch.arange(-args.step*args.count, args.step*(args.count+0.01), args.step, device=device)*dist_stddev
             latents = center_latent[:, None, :] + steps[None, :, None] * dirs[i, None, None, :]
             latents_plain = latents.reshape((args.sample*row_size, args.latent))
             images = torch.empty((args.sample*row_size, 3, args.size, args.size), device=device)
